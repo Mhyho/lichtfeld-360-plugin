@@ -149,6 +149,36 @@ def _open_file_via_win32(title: str, filters: list[tuple[str, str]]) -> str:
     return file_buf.value
 
 
+def _open_file_via_win32_sta(title: str, filters: list[tuple[str, str]]) -> str:
+    """Run the Win32 Open-File dialog on a dedicated STA thread.
+
+    LichtFeld's UI thread may be COM-initialized as MTA, in which case the
+    explorer-style GetOpenFileNameW silently fails (returns FALSE with
+    CommDlgExtendedError()==0, indistinguishable from a user cancel). A fresh
+    worker thread has no apartment yet, so CoInitializeEx(STA) succeeds there
+    and the dialog shows correctly.
+    """
+    result: dict[str, object] = {"path": "", "err": None}
+
+    def _worker() -> None:
+        ole32 = ctypes.windll.ole32
+        hr = ole32.CoInitializeEx(None, 0x2)  # COINIT_APARTMENTTHREADED
+        try:
+            result["path"] = _open_file_via_win32(title, filters)
+        except Exception as exc:  # noqa: BLE001
+            result["err"] = exc
+        finally:
+            if hr in (0, 1):  # S_OK / S_FALSE -> we initialized, must uninit
+                ole32.CoUninitialize()
+
+    t = threading.Thread(target=_worker, name="lfs360-filedialog", daemon=True)
+    t.start()
+    t.join()
+    if result["err"] is not None:
+        raise result["err"]  # type: ignore[misc]
+    return str(result["path"])
+
+
 _PANEL_SPACE_MAIN = getattr(
     lf.ui.PanelSpace,
     "MAIN_PANEL_TAB",
@@ -2295,7 +2325,7 @@ class Plugin360Panel(lf.ui.Panel):
         """
         if os.name == "nt":
             try:
-                return _open_file_via_win32(
+                return _open_file_via_win32_sta(
                     title=title,
                     filters=[
                         ("All supported video",
@@ -2390,9 +2420,15 @@ class Plugin360Panel(lf.ui.Panel):
         # Auto-detect dual fisheye input from extension and flip Output Mode
         # to Fisheye proactively so the right UI appears before VideoAnalyzer
         # finishes (VideoAnalyzer also handles .osv/.insv via ffprobe).
-        from ..core.pipeline import detect_input_type
-
-        input_type, family = detect_input_type(path)
+        try:
+            from ..core.pipeline import detect_input_type
+            input_type, family = detect_input_type(path)
+        except Exception as exc:
+            logger.error("Failed to load video pipeline: %s", exc)
+            self._error_message = f"Could not load video: {exc}"
+            if self._handle:
+                self._handle.dirty_all()
+            return
         if input_type == "dual_fisheye":
             self._output_mode_idx = FISHEYE_PINHOLE_OUTPUT_MODE_IDX
             self._colmap_matcher_idx = 0  # sequential

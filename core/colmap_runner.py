@@ -250,12 +250,33 @@ def _configure_ba(solver: str, camera_model: str):
     local_ba = pycolmap.BundleAdjustmentOptions()
     global_ba = pycolmap.BundleAdjustmentOptions()
 
+    # GPU bundle adjustment is driven by ceres.use_gpu + auto_select_solver_type
+    # plus the per-solver image-count thresholds; the cuDSS GPU sparse solver is
+    # engaged automatically within max_num_images_direct_sparse_gpu_solver. The
+    # explicit CUDA_SPARSE enum member only exists on the never-released dev2
+    # wheel — the installable dev0 cuDSS wheel exposes GPU BA purely via use_gpu,
+    # so gate on actual CUDA availability rather than that missing enum member.
+    DLA = type(pycolmap.IncrementalPipelineOptions()
+               .get_local_bundle_adjustment()
+               .ceres.solver_options.dense_linear_algebra_library_type)
+    _GPU_BA = bool(getattr(pycolmap, "has_cuda", False)) and pycolmap.get_num_cuda_devices() > 0
+
     def _enable_ceres_gpu(opts):
-        """Enable GPU-accelerated Ceres with cuDSS sparse solver."""
+        """Enable GPU-accelerated Ceres BA (cuDSS GPU sparse + CUDA dense
+        solvers via auto-selection), degrading to CPU when CUDA is absent."""
         opts.backend = CERES
-        opts.ceres.use_gpu = True
+        opts.ceres.use_gpu = _GPU_BA
         opts.ceres.auto_select_solver_type = True
-        opts.ceres.solver_options.sparse_linear_algebra_library_type = SLA.CUDA_SPARSE
+        so = opts.ceres.solver_options
+        if _GPU_BA and hasattr(DLA, "CUDA"):
+            so.dense_linear_algebra_library_type = DLA.CUDA
+        # Prefer the explicit CUDA sparse backend when present (dev2+); else keep
+        # SUITE_SPARSE as the large-problem CPU fallback (GPU direct sparse is
+        # still used under the image-count threshold).
+        if hasattr(SLA, "CUDA_SPARSE"):
+            so.sparse_linear_algebra_library_type = SLA.CUDA_SPARSE
+        elif hasattr(SLA, "SUITE_SPARSE"):
+            so.sparse_linear_algebra_library_type = SLA.SUITE_SPARSE
 
     if solver == "ceres":
         # Pure CPU Ceres — for debugging or baseline comparison
@@ -1197,6 +1218,9 @@ except Exception as exc:
                 if global_ba_opts.ceres.use_gpu:
                     ba.ceres.solver_options.sparse_linear_algebra_library_type = (
                         global_ba_opts.ceres.solver_options.sparse_linear_algebra_library_type
+                    )
+                    ba.ceres.solver_options.dense_linear_algebra_library_type = (
+                        global_ba_opts.ceres.solver_options.dense_linear_algebra_library_type
                     )
             ba.refine_sensor_from_rig = False
             global_opts.mapper.refine_sensor_from_rig = False
